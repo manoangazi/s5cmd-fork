@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/hashicorp/go-multierror"
 	"github.com/urfave/cli/v2"
@@ -664,7 +665,7 @@ func (c Copy) doDownload(ctx context.Context, srcurl *url.URL, dsturl *url.URL) 
 		return err
 	}
 
-	writer := newCountingReaderWriter(file, c.progressbar)
+	writer := newCountingReaderWriter(file, c.progressbar, srcurl, dsturl, 0)
 	size, err := srcClient.Get(ctx, srcurl, writer, c.concurrency, c.partSize)
 	file.Close()
 
@@ -745,7 +746,11 @@ func (c Copy) doUpload(ctx context.Context, srcurl *url.URL, dsturl *url.URL, ex
 		metadata.ContentType = guessContentType(file)
 	}
 
-	reader := newCountingReaderWriter(file, c.progressbar)
+	var uploadSize int64
+	if fi, statErr := file.Stat(); statErr == nil {
+		uploadSize = fi.Size()
+	}
+	reader := newCountingReaderWriter(file, c.progressbar, srcurl, dsturl, uploadSize)
 	err = dstClient.Put(ctx, reader, dsturl, metadata, c.concurrency, c.partSize)
 
 	if err != nil {
@@ -1094,44 +1099,94 @@ func guessContentType(file *os.File) string {
 	return contentType
 }
 
+// progressEmitInterval throttles how often a countingReaderWriter emits a
+// ProgressMessage. 500ms gives a smooth UI and enough samples for the bandwidth
+// probe to discard TCP slow-start ramp yet keep a solid steady-state window,
+// while still keeping stdout quiet with hundreds of concurrent workers (the app
+// coalesces these to ~1s for its own UI updates).
+const progressEmitInterval = 500 * time.Millisecond
+
 type countingReaderWriter struct {
 	pb      progressbar.ProgressBar
 	fp      *os.File
 	signMap map[int64]struct{}
 	mu      sync.Mutex
+
+	// Real-time progress emission (JSON mode only). These identify the object
+	// being transferred and track cumulative bytes so a consumer can render
+	// intra-file progress instead of a single jump on completion.
+	emit        bool
+	src, dst    *url.URL
+	size        int64
+	transferred int64
+	lastEmit    time.Time
 }
 
-func newCountingReaderWriter(file *os.File, pb progressbar.ProgressBar) *countingReaderWriter {
+func newCountingReaderWriter(file *os.File, pb progressbar.ProgressBar, srcurl, dsturl *url.URL, size int64) *countingReaderWriter {
 	return &countingReaderWriter{
 		pb:      pb,
 		fp:      file,
 		signMap: map[int64]struct{}{},
+		emit:    log.IsJSON(),
+		src:     srcurl,
+		dst:     dsturl,
+		size:    size,
+	}
+}
+
+// addBytes records n newly transferred bytes on the shared progress bar and,
+// in JSON mode, emits a throttled cumulative ProgressMessage for this object.
+func (r *countingReaderWriter) addBytes(n int64) {
+	r.pb.AddCompletedBytes(n)
+	if !r.emit {
+		return
+	}
+	r.mu.Lock()
+	r.transferred += n
+	var snapshot int64
+	var doEmit bool
+	if now := time.Now(); now.Sub(r.lastEmit) >= progressEmitInterval {
+		r.lastEmit = now
+		snapshot = r.transferred
+		doEmit = true
+	}
+	r.mu.Unlock()
+	if doEmit {
+		log.Info(log.ProgressMessage{
+			Operation:        "progress",
+			Source:           r.src,
+			Destination:      r.dst,
+			BytesTransferred: snapshot,
+			TotalBytes:       r.size,
+		})
 	}
 }
 
 func (r *countingReaderWriter) WriteAt(p []byte, off int64) (int, error) {
 	n, err := r.fp.WriteAt(p, off)
-	r.pb.AddCompletedBytes(int64(n))
+	r.addBytes(int64(n))
 	return n, err
 }
 
 func (r *countingReaderWriter) Read(p []byte) (int, error) {
 	n, err := r.fp.Read(p)
-	r.pb.AddCompletedBytes(int64(n))
+	r.addBytes(int64(n))
 	return n, err
 }
 
 func (r *countingReaderWriter) ReadAt(p []byte, off int64) (int, error) {
 	n, err := r.fp.ReadAt(p, off)
 	r.mu.Lock()
-	// Ignore the first signature call
-	if _, ok := r.signMap[off]; ok {
-		// Got the length have read (or means has uploaded)
-		r.pb.AddCompletedBytes(int64(n))
-	} else {
+	// Ignore the first signature call.
+	_, seen := r.signMap[off]
+	if !seen {
 		r.signMap[off] = struct{}{}
 	}
 	r.mu.Unlock()
+	if seen {
+		// Got the length have read (or means has uploaded).
+		r.addBytes(int64(n))
+	}
 	return n, err
 }
 

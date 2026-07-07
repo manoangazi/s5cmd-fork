@@ -178,7 +178,15 @@ func (d Delete) Run(ctx context.Context) error {
 		defer close(urlch)
 
 		for object := range objch {
-			if object.Type.IsDir() || errorpkg.IsCancelation(object.Err) {
+			// Skip directory-typed objects only for local paths (avoid trying
+			// to remove a real directory during a wildcard file delete). On
+			// remote storage a "directory" is just a zero-byte folder-marker
+			// key ending in "/", which a recursive delete SHOULD remove —
+			// otherwise empty folders (marker only) become un-deletable.
+			if object.Type.IsDir() && (object.URL == nil || !object.URL.IsRemote()) {
+				continue
+			}
+			if errorpkg.IsCancelation(object.Err) {
 				continue
 			}
 

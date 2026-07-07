@@ -49,6 +49,29 @@ func (i InfoMessage) JSON() string {
 	return strutil.JSON(i)
 }
 
+// ProgressMessage reports intra-file transfer progress for a single object.
+// It is emitted periodically during a cp/upload/download (in JSON mode only),
+// carrying the cumulative bytes transferred for that object so far so that a
+// consumer can render smooth progress for large files rather than a single
+// jump on completion.
+type ProgressMessage struct {
+	Operation        string   `json:"operation"`
+	Source           *url.URL `json:"source,omitempty"`
+	Destination      *url.URL `json:"destination,omitempty"`
+	BytesTransferred int64    `json:"bytes_transferred"`
+	TotalBytes       int64    `json:"total_bytes,omitempty"`
+}
+
+// String is the string representation of ProgressMessage.
+func (p ProgressMessage) String() string {
+	return fmt.Sprintf("%v %v %v/%v", p.Operation, p.Destination, p.BytesTransferred, p.TotalBytes)
+}
+
+// JSON is the JSON representation of ProgressMessage.
+func (p ProgressMessage) JSON() string {
+	return strutil.JSON(p)
+}
+
 // ErrorMessage is a generic message structure for unsuccessful operations.
 type ErrorMessage struct {
 	Operation string `json:"operation,omitempty"`

@@ -22,6 +22,13 @@ func Init(level string, json bool) {
 	global = New(level, json)
 }
 
+// IsJSON reports whether the global logger is emitting JSON-formatted output.
+// Callers use this to decide whether to emit machine-readable progress messages
+// that would only clutter plain-text terminal output.
+func IsJSON() bool {
+	return global != nil && global.json
+}
+
 // Trace prints message in trace mode.
 func Trace(msg Message) {
 	global.printf(LevelTrace, msg, os.Stdout)
