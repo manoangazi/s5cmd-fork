@@ -9,7 +9,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/hashicorp/go-multierror"
 	"github.com/lanrat/extsort"
 	"github.com/urfave/cli/v2"
@@ -592,11 +591,8 @@ func (s Sync) shouldStopSync(err error) bool {
 	if err == storage.ErrNoObjectFound {
 		return false
 	}
-	if awsErr, ok := err.(awserr.Error); ok {
-		switch awsErr.Code() {
-		case "AccessDenied", "NoSuchBucket":
-			return true
-		}
+	if storage.ErrHasCode(err, "AccessDenied", "NoSuchBucket") {
+		return true
 	}
 	return s.exitOnError
 }

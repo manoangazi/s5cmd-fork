@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/lanrat/extsort"
@@ -105,14 +106,16 @@ func (o *Options) SetRegion(region string) {
 
 // Object is a generic type which contains metadata for storage items.
 type Object struct {
-	URL          *url.URL     `json:"key,omitempty"`
-	Etag         string       `json:"etag,omitempty"`
-	ModTime      *time.Time   `json:"last_modified,omitempty"`
-	Type         ObjectType   `json:"type,omitempty"`
-	Size         int64        `json:"size,omitempty"`
-	StorageClass StorageClass `json:"storage_class,omitempty"`
-	Err          error        `json:"error,omitempty"`
-	retryID      string
+	URL               *url.URL     `json:"key,omitempty"`
+	Etag              string       `json:"etag,omitempty"`
+	ChecksumCRC32C    string       `json:"checksum_crc32c,omitempty"`
+	ChecksumCRC64NVME string       `json:"checksum_crc64nvme,omitempty"`
+	ModTime           *time.Time   `json:"last_modified,omitempty"`
+	Type              ObjectType   `json:"type,omitempty"`
+	Size              int64        `json:"size,omitempty"`
+	StorageClass      StorageClass `json:"storage_class,omitempty"`
+	Err               error        `json:"error,omitempty"`
+	retryID           string
 
 	// the VersionID field exist only for JSON Marshall, it must not be used for
 	// any other purpose. URL.VersionID must be used instead.
@@ -265,7 +268,15 @@ func FromBytes(data []byte) extsort.SortType {
 
 // Less returns if relative path of storage.Object a's URL comes before the one
 // of b's in the lexicographic order.
-// It assumes that both a, and b are the instances of Object
+// It assumes that both a, and b are the instances of Object.
+//
+// The path is slash-normalized before comparison so the sort order matches the
+// key the sync merge compares on (compareObjects uses filepath.ToSlash). On
+// Windows, local relative paths contain backslashes (filepath.Rel output); if
+// we sorted on those raw, the source stream would be ordered by '\\' (0x5C)
+// while the merge compares by '/' (0x2F), desynchronizing the ordered merge and
+// causing files to be misclassified as source-only (needless re-upload) or
+// destination-only (wrongly deleted under --delete).
 func Less(a, b extsort.SortType) bool {
-	return a.(Object).URL.Relative() < b.(Object).URL.Relative()
+	return filepath.ToSlash(a.(Object).URL.Relative()) < filepath.ToSlash(b.(Object).URL.Relative())
 }

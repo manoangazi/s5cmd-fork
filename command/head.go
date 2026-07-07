@@ -131,6 +131,8 @@ func (h Head) Run(ctx context.Context) error {
 		StorageClass:         string(object.StorageClass),
 		VersionID:            object.VersionID,
 		ETag:                 object.Etag,
+		ChecksumCRC32C:       object.ChecksumCRC32C,
+		ChecksumCRC64NVME:    object.ChecksumCRC64NVME,
 		Metadata:             metadata.UserDefined,
 	}
 
@@ -148,6 +150,8 @@ type HeadObjectMessage struct {
 	StorageClass         string            `json:"storage_class,omitempty"`
 	VersionID            string            `json:"version_id,omitempty"`
 	ETag                 string            `json:"etag,omitempty"`
+	ChecksumCRC32C       string            `json:"checksum_crc32c,omitempty"`
+	ChecksumCRC64NVME    string            `json:"checksum_crc64nvme,omitempty"`
 	Metadata             map[string]string `json:"metadata"`
 }
 

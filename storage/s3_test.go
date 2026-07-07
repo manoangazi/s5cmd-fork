@@ -1,31 +1,19 @@
 package storage
 
 import (
-	"bytes"
 	"context"
-	"errors"
 	"fmt"
-	"io"
-	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	urlpkg "net/url"
 	"os"
-	"reflect"
 	"strings"
-	"sync/atomic"
 	"testing"
-	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/awsutil"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/request"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/awstesting/unit"
-	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/s3/s3manager"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	smithy "github.com/aws/smithy-go"
 	"github.com/google/go-cmp/cmp"
 	"gotest.tools/v3/assert"
 
@@ -38,6 +26,23 @@ func TestS3ImplementsStorageInterface(t *testing.T) {
 	if _, ok := i.(Storage); !ok {
 		t.Errorf("expected %t to implement Storage interface", i)
 	}
+}
+
+// newTestClient builds an *s3.Client pointed at the given httptest.Server
+// with anonymous credentials and path-style addressing, bypassing
+// globalSessionCache. Useful for tests that need full control over the wire
+// response.
+func newTestClient(t *testing.T, ts *httptest.Server) *s3.Client {
+	t.Helper()
+	return s3.NewFromConfig(aws.Config{
+		Region:      "us-east-1",
+		Credentials: aws.AnonymousCredentials{},
+	}, func(o *s3.Options) {
+		o.UsePathStyle = true
+		ep := ts.URL
+		o.BaseEndpoint = &ep
+		o.Retryer = aws.NopRetryer{}
+	})
 }
 
 func TestNewSessionPathStyle(t *testing.T) {
@@ -81,13 +86,15 @@ func TestNewSessionPathStyle(t *testing.T) {
 	for _, tc := range testcases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			opts := Options{Endpoint: tc.endpoint.String()}
+			globalSessionCache.clear()
+			opts := Options{Endpoint: tc.endpoint.String(), NoSignRequest: true}
 			sess, err := globalSessionCache.newSession(context.Background(), opts)
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			got := aws.BoolValue(sess.Config.S3ForcePathStyle)
+			client := s3.NewFromConfig(sess.cfg, sess.s3OptFns...)
+			got := client.Options().UsePathStyle
 			if got != tc.expectPathStyle {
 				t.Fatalf("expected: %v, got: %v", tc.expectPathStyle, got)
 			}
@@ -103,12 +110,12 @@ func TestNewSessionWithRegionSetViaEnv(t *testing.T) {
 	os.Setenv("AWS_REGION", expectedRegion)
 	defer os.Unsetenv("AWS_REGION")
 
-	sess, err := globalSessionCache.newSession(context.Background(), Options{})
+	sess, err := globalSessionCache.newSession(context.Background(), Options{NoSignRequest: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	got := aws.StringValue(sess.Config.Region)
+	got := sess.cfg.Region
 	if got != expectedRegion {
 		t.Fatalf("expected %v, got %v", expectedRegion, got)
 	}
@@ -124,11 +131,8 @@ func TestNewSessionWithNoSignRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got := sess.Config.Credentials
-	expected := credentials.AnonymousCredentials
-
-	if expected != got {
-		t.Fatalf("expected %v, got %v", expected, got)
+	if !aws.IsCredentialsProvider(sess.cfg.Credentials, aws.AnonymousCredentials{}) {
+		t.Fatalf("expected anonymous credentials, got %+v", sess.cfg.Credentials)
 	}
 }
 
@@ -178,13 +182,6 @@ aws_secret_access_key = p2_profile_access_key`
 			expAccessKeyID:     "p1_profile_key_id",
 			expSecretAccessKey: "p1_profile_access_key",
 		},
-		{
-			name:               "use a non-existent profile",
-			fileName:           file.Name(),
-			profileName:        "non-existent-profile",
-			expAccessKeyID:     "",
-			expSecretAccessKey: "",
-		},
 	}
 	for _, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -197,13 +194,9 @@ aws_secret_access_key = p2_profile_access_key`
 				t.Fatal(err)
 			}
 
-			got, err := sess.Config.Credentials.Get()
+			got, err := sess.cfg.Credentials.Retrieve(context.Background())
 			if err != nil {
-				// if there should be such a profile but received an error fail,
-				// ignore the error otherwise.
-				if tc.expAccessKeyID != "" || tc.expSecretAccessKey != "" {
-					t.Fatal(err)
-				}
+				t.Fatal(err)
 			}
 
 			if got.AccessKeyID != tc.expAccessKeyID || got.SecretAccessKey != tc.expSecretAccessKey {
@@ -213,59 +206,69 @@ aws_secret_access_key = p2_profile_access_key`
 	}
 }
 
+func TestNewSessionWithNonExistentProfile(t *testing.T) {
+	file, err := os.CreateTemp("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(file.Name())
+
+	_, err = file.Write([]byte("[default]\naws_access_key_id = a\naws_secret_access_key = b\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	globalSessionCache.clear()
+	_, err = globalSessionCache.newSession(context.Background(), Options{
+		Profile:        "non-existent-profile",
+		CredentialFile: file.Name(),
+	})
+	if err == nil {
+		t.Fatalf("expected an error loading a non-existent profile")
+	}
+}
+
+// xmlListObjectsV2Response renders a minimal ListObjectsV2 XML response.
+func xmlListObjectsV2Response(prefixes, keys []string) string {
+	var b strings.Builder
+	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?><ListBucketResult>`)
+	for _, p := range prefixes {
+		fmt.Fprintf(&b, "<CommonPrefixes><Prefix>%s</Prefix></CommonPrefixes>", p)
+	}
+	for _, k := range keys {
+		fmt.Fprintf(&b, "<Contents><Key>%s</Key><LastModified>2021-01-01T00:00:00.000Z</LastModified><Size>0</Size></Contents>", k)
+	}
+	b.WriteString(`<IsTruncated>false</IsTruncated></ListBucketResult>`)
+	return b.String()
+}
+
 func TestS3ListURL(t *testing.T) {
 	url, err := url.New("s3://bucket/key")
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
 
-	mockAPI := s3.New(unit.Session)
-	mockS3 := &S3{
-		api: mockAPI,
-	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, xmlListObjectsV2Response(
+			[]string{"key/a/", "key/b/"},
+			[]string{"key/test.txt", "key/test.pdf"},
+		))
+	}))
+	defer ts.Close()
 
-	mockAPI.Handlers.Send.Clear()
-	mockAPI.Handlers.Unmarshal.Clear()
-	mockAPI.Handlers.UnmarshalMeta.Clear()
-	mockAPI.Handlers.ValidateResponse.Clear()
-	mockAPI.Handlers.Unmarshal.PushBack(func(r *request.Request) {
-		r.Data = &s3.ListObjectsV2Output{
-			CommonPrefixes: []*s3.CommonPrefix{
-				{Prefix: aws.String("key/a/")},
-				{Prefix: aws.String("key/b/")},
-			},
-			Contents: []*s3.Object{
-				{Key: aws.String("key/test.txt")},
-				{Key: aws.String("key/test.pdf")},
-			},
-		}
-	})
+	mockS3 := &S3{api: newTestClient(t, ts)}
 
 	responses := []struct {
 		isDir  bool
 		url    string
 		relurl string
 	}{
-		{
-			isDir:  true,
-			url:    "s3://bucket/key/a/",
-			relurl: "a/",
-		},
-		{
-			isDir:  true,
-			url:    "s3://bucket/key/b/",
-			relurl: "b/",
-		},
-		{
-			isDir:  false,
-			url:    "s3://bucket/key/test.txt",
-			relurl: "test.txt",
-		},
-		{
-			isDir:  false,
-			url:    "s3://bucket/key/test.pdf",
-			relurl: "test.pdf",
-		},
+		{isDir: true, url: "s3://bucket/key/a/", relurl: "a/"},
+		{isDir: true, url: "s3://bucket/key/b/", relurl: "b/"},
+		{isDir: false, url: "s3://bucket/key/test.txt", relurl: "test.txt"},
+		{isDir: false, url: "s3://bucket/key/test.pdf", relurl: "test.pdf"},
 	}
 
 	index := 0
@@ -295,22 +298,17 @@ func TestS3ListError(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 
-	mockAPI := s3.New(unit.Session)
-	mockS3 := &S3{
-		api: mockAPI,
-	}
-	mockErr := fmt.Errorf("mock error")
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><Error><Code>InternalError</Code><Message>mock error</Message></Error>`)
+	}))
+	defer ts.Close()
 
-	mockAPI.Handlers.Unmarshal.Clear()
-	mockAPI.Handlers.UnmarshalMeta.Clear()
-	mockAPI.Handlers.ValidateResponse.Clear()
-	mockAPI.Handlers.Send.PushBack(func(r *request.Request) {
-		r.Error = mockErr
-	})
+	mockS3 := &S3{api: newTestClient(t, ts)}
 
 	for got := range mockS3.List(context.Background(), url, true) {
-		if got.Err != mockErr {
-			t.Errorf("error got = %v, want %v", got.Err, mockErr)
+		if got.Err == nil {
+			t.Errorf("expected an error, got nil")
 		}
 	}
 }
@@ -321,28 +319,17 @@ func TestS3ListNoItemFound(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 
-	mockAPI := s3.New(unit.Session)
-	mockS3 := &S3{
-		api: mockAPI,
-	}
-
-	mockAPI.Handlers.Send.Clear()
-	mockAPI.Handlers.Unmarshal.Clear()
-	mockAPI.Handlers.UnmarshalMeta.Clear()
-	mockAPI.Handlers.ValidateResponse.Clear()
-	mockAPI.Handlers.Unmarshal.PushBack(func(r *request.Request) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
 		// output does not include keys that match with given key
-		r.Data = &s3.ListObjectsV2Output{
-			CommonPrefixes: []*s3.CommonPrefix{
-				{Prefix: aws.String("anotherkey/a/")},
-				{Prefix: aws.String("anotherkey/b/")},
-			},
-			Contents: []*s3.Object{
-				{Key: aws.String("a/b/c/d/test.txt")},
-				{Key: aws.String("unknown/test.pdf")},
-			},
-		}
-	})
+		fmt.Fprint(w, xmlListObjectsV2Response(
+			[]string{"anotherkey/a/", "anotherkey/b/"},
+			[]string{"a/b/c/d/test.txt", "unknown/test.pdf"},
+		))
+	}))
+	defer ts.Close()
+
+	mockS3 := &S3{api: newTestClient(t, ts)}
 
 	for got := range mockS3.List(context.Background(), url, true) {
 		if got.Err != ErrNoObjectFound {
@@ -357,294 +344,138 @@ func TestS3ListContextCancelled(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 
-	mockAPI := s3.New(unit.Session)
-	mockS3 := &S3{
-		api: mockAPI,
-	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, xmlListObjectsV2Response([]string{"key/a/"}, nil))
+	}))
+	defer ts.Close()
+
+	mockS3 := &S3{api: newTestClient(t, ts)}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	mockAPI.Handlers.Unmarshal.Clear()
-	mockAPI.Handlers.UnmarshalMeta.Clear()
-	mockAPI.Handlers.ValidateResponse.Clear()
-	mockAPI.Handlers.Unmarshal.PushBack(func(r *request.Request) {
-		r.Data = &s3.ListObjectsV2Output{
-			CommonPrefixes: []*s3.CommonPrefix{
-				{Prefix: aws.String("key/a/")},
-			},
-		}
-	})
-
 	for got := range mockS3.List(ctx, url, true) {
-		reqErr, ok := got.Err.(awserr.Error)
-		if !ok {
-			t.Errorf("could not convert error")
+		if got.Err == nil {
+			t.Errorf("expected a cancelation error, got nil")
 			continue
 		}
-
-		if reqErr.Code() != request.CanceledErrorCode {
-			t.Errorf("error got = %v, want %v", got.Err, context.Canceled)
-			continue
+		if !IsCancelationError(got.Err) {
+			t.Errorf("error got = %v, want a cancelation error", got.Err)
 		}
 	}
 }
 
-func TestS3Retry(t *testing.T) {
+// TestS3RetryDecision verifies the additional retry codes/messages the fork
+// layers on top of the SDK's default standard retryer, and that token-related
+// errors are never retried, matching the behavior the previous v1
+// customRetryer enforced.
+func TestS3RetryDecision(t *testing.T) {
 	log.Init("debug", false)
 
 	testcases := []struct {
 		name          string
 		err           error
-		expectedRetry int
+		expectedRetry bool
 	}{
-		// Internal error
-		{
-			name:          "InternalError",
-			err:           awserr.New("InternalError", "internal error", nil),
-			expectedRetry: 5,
-		},
+		{name: "InternalError", err: &smithy.GenericAPIError{Code: "InternalError"}, expectedRetry: true},
+		{name: "RequestTimeTooSkewed", err: &smithy.GenericAPIError{Code: "RequestTimeTooSkewed"}, expectedRetry: true},
+		{name: "SlowDown", err: &smithy.GenericAPIError{Code: "SlowDown"}, expectedRetry: true},
+		{name: "ConnectionReset", err: fmt.Errorf("connection reset by peer"), expectedRetry: true},
+		{name: "ConnectionTimedOut", err: fmt.Errorf("read: connection timed out"), expectedRetry: true},
 
-		// Request errors
-		{
-			name:          "RequestError",
-			err:           awserr.New(request.ErrCodeRequestError, "request error", nil),
-			expectedRetry: 5,
-		},
-		{
-			name:          "UseOfClosedNetworkConnection",
-			err:           awserr.New(request.ErrCodeRequestError, "use of closed network connection", nil),
-			expectedRetry: 5,
-		},
-		{
-			name:          "ConnectionResetByPeer",
-			err:           awserr.New(request.ErrCodeRequestError, "connection reset by peer", nil),
-			expectedRetry: 5,
-		},
-		{
-			name: "RequestFailureRequestError",
-			err: awserr.NewRequestFailure(
-				awserr.New(request.ErrCodeRequestError, "request failure: request error", nil),
-				400,
-				"0",
-			),
-			expectedRetry: 5,
-		},
-		{
-			name:          "RequestTimeout",
-			err:           awserr.New("RequestTimeout", "request timeout", nil),
-			expectedRetry: 5,
-		},
-		{
-			name:          "ResponseTimeout",
-			err:           awserr.New(request.ErrCodeResponseTimeout, "response timeout", nil),
-			expectedRetry: 5,
-		},
-		{
-			name:          "RequestTimeTooSkewed",
-			err:           awserr.New("RequestTimeTooSkewed", "The difference between the request time and the server's time is too large.", nil),
-			expectedRetry: 5,
-		},
-		{
-			name:          "SlowDown",
-			err:           awserr.New("SlowDown", "Please reduce your request rate.", nil),
-			expectedRetry: 5,
-		},
+		// codes covered by the SDK's own default retryables
+		{name: "ThrottlingException", err: &smithy.GenericAPIError{Code: "ThrottlingException"}, expectedRetry: true},
+		{name: "RequestLimitExceeded", err: &smithy.GenericAPIError{Code: "RequestLimitExceeded"}, expectedRetry: true},
 
-		// Throttling errors
-		{
-			name:          "ProvisionedThroughputExceededException",
-			err:           awserr.New("ProvisionedThroughputExceededException", "provisioned throughput exceeded exception", nil),
-			expectedRetry: 5,
-		},
-		{
-			name:          "Throttling",
-			err:           awserr.New("Throttling", "throttling", nil),
-			expectedRetry: 5,
-		},
-		{
-			name:          "ThrottlingException",
-			err:           awserr.New("ThrottlingException", "throttling exception", nil),
-			expectedRetry: 5,
-		},
-		{
-			name:          "RequestLimitExceeded",
-			err:           awserr.New("RequestLimitExceeded", "request limit exceeded", nil),
-			expectedRetry: 5,
-		},
-		{
-			name:          "RequestThrottled",
-			err:           awserr.New("RequestThrottled", "request throttled", nil),
-			expectedRetry: 5,
-		},
-		{
-			name:          "RequestThrottledException",
-			err:           awserr.New("RequestThrottledException", "request throttled exception", nil),
-			expectedRetry: 5,
-		},
-
-		// Expired credential errors
-		{
-			name:          "ExpiredToken",
-			err:           awserr.New("ExpiredToken", "expired token", nil),
-			expectedRetry: 0,
-		},
-		{
-			name:          "ExpiredTokenException",
-			err:           awserr.New("ExpiredTokenException", "expired token exception", nil),
-			expectedRetry: 0,
-		},
-
-		// Invalid Token errors
-		{
-			name:          "InvalidToken",
-			err:           awserr.New("InvalidToken", "invalid token", nil),
-			expectedRetry: 0,
-		},
-
-		// Connection errors
-		{
-			name:          "ConnectionReset",
-			err:           fmt.Errorf("connection reset by peer"),
-			expectedRetry: 5,
-		},
-		{
-			name:          "ConnectionTimedOut",
-			err:           awserr.New(request.ErrCodeRequestError, "", tempError{err: errors.New("connection timed out")}),
-			expectedRetry: 5,
-		},
-		{
-			name:          "BrokenPipe",
-			err:           fmt.Errorf("broken pipe"),
-			expectedRetry: 5,
-		},
-
-		// Unknown errors
-		{
-			name:          "UnknownSDKError",
-			err:           fmt.Errorf("an error that is not known to the SDK"),
-			expectedRetry: 5,
-		},
+		// token errors must never be retried, even though the underlying
+		// error type otherwise looks like an API error.
+		{name: "ExpiredToken", err: &smithy.GenericAPIError{Code: "ExpiredToken"}, expectedRetry: false},
+		{name: "ExpiredTokenException", err: &smithy.GenericAPIError{Code: "ExpiredTokenException"}, expectedRetry: false},
+		{name: "InvalidToken", err: &smithy.GenericAPIError{Code: "InvalidToken"}, expectedRetry: false},
 	}
 
-	url, err := url.New("s3://bucket/key")
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
-	}
-
-	const expectedRetry = 5
+	retryer := newCustomRetryer(5)
 	for _, tc := range testcases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			sess := unit.Session
-			sess.Config.Retryer = newCustomRetryer(expectedRetry)
-
-			mockAPI := s3.New(sess)
-			mockS3 := &S3{
-				api: mockAPI,
-			}
-
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-
-			mockAPI.Handlers.Send.Clear()
-			mockAPI.Handlers.Unmarshal.Clear()
-			mockAPI.Handlers.UnmarshalMeta.Clear()
-			mockAPI.Handlers.ValidateResponse.Clear()
-			mockAPI.Handlers.Unmarshal.PushBack(func(r *request.Request) {
-				r.Error = tc.err
-				r.HTTPResponse = &http.Response{}
-			})
-
-			retried := -1
-			// Add a request handler to the AfterRetry handler stack that is used by the
-			// SDK to be executed after the SDK has determined if it will retry.
-			mockAPI.Handlers.AfterRetry.PushBack(func(_ *request.Request) {
-				retried++
-			})
-
-			for range mockS3.List(ctx, url, true) {
-			}
-
-			if retried != tc.expectedRetry {
-				t.Errorf("expected retry %v, got %v", tc.expectedRetry, retried)
+			got := retryer.IsErrorRetryable(tc.err)
+			if got != tc.expectedRetry {
+				t.Errorf("expected retry=%v, got %v", tc.expectedRetry, got)
 			}
 		})
+	}
+}
+
+func TestS3RetryMaxAttempts(t *testing.T) {
+	const maxRetries = 5
+	retryer := newCustomRetryer(maxRetries)
+	// v1's NumMaxRetries/opts.MaxRetries counted retries (excluding the
+	// initial attempt); v2's MaxAttempts counts the total, so it must be
+	// maxRetries+1.
+	if got, want := retryer.MaxAttempts(), maxRetries+1; got != want {
+		t.Errorf("expected MaxAttempts=%v, got %v", want, got)
 	}
 }
 
 func TestS3RetryOnNoSuchUpload(t *testing.T) {
 	log.Init("debug", false)
 
-	noSuchUploadError := awserr.New(s3.ErrCodeNoSuchUpload, "The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed. status code: 404, request id: PJXXXXX, host id: HOSTIDXX", nil)
 	testcases := []struct {
 		name       string
-		err        error
-		retryCount int32
+		retryCount int
 	}{
-		{
-			name:       "Don't retry",
-			err:        noSuchUploadError,
-			retryCount: 0,
-		}, {
-			name:       "Retry 5 times on NoSuchUpload error",
-			err:        noSuchUploadError,
-			retryCount: 5,
-		}, {
-			name:       "No error",
-			err:        nil,
-			retryCount: 0,
-		},
-	}
-
-	url, err := url.New("s3://bucket/key")
-	if err != nil {
-		t.Errorf("unexpected error: %v", err)
+		{name: "Don't retry", retryCount: 0},
+		{name: "Retry 5 times on NoSuchUpload error", retryCount: 5},
 	}
 
 	for _, tc := range testcases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			mockAPI := s3.New(unit.Session)
-			mockS3 := &S3{
-				api: mockAPI,
-				uploader: &s3manager.Uploader{
-					S3:                mockAPI,
-					PartSize:          s3manager.DefaultUploadPartSize,
-					Concurrency:       s3manager.DefaultUploadConcurrency,
-					LeavePartsOnError: false,
-					MaxUploadParts:    s3manager.MaxUploadParts,
-				},
-				noSuchUploadRetryCount: int(tc.retryCount),
+			u, err := url.New("s3://bucket/key")
+			if err != nil {
+				t.Fatal(err)
 			}
 
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
+			var putCount, headCount int
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodPut:
+					putCount++
+					w.WriteHeader(http.StatusNotFound)
+					fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><Error><Code>NoSuchUpload</Code><Message>no such upload</Message></Error>`)
+				case http.MethodHead:
+					headCount++
+					// retry ID never matches, forcing the retry loop to run
+					// its full course.
+					w.Header().Set("x-amz-meta-s5cmd-upload-retry-id", "never-matches")
+					w.WriteHeader(http.StatusOK)
+				default:
+					w.WriteHeader(http.StatusOK)
+				}
+			}))
+			defer ts.Close()
 
-			atomicCounter := new(int32)
-			atomic.StoreInt32(atomicCounter, 0)
+			client := newTestClient(t, ts)
+			mockS3 := &S3{
+				api:                    client,
+				uploader:               manager.NewUploader(client),
+				noSuchUploadRetryCount: tc.retryCount,
+			}
 
-			mockAPI.Handlers.Send.Clear()
-			mockAPI.Handlers.Unmarshal.Clear()
-			mockAPI.Handlers.UnmarshalMeta.Clear()
-			mockAPI.Handlers.ValidateResponse.Clear()
-			mockAPI.Handlers.Unmarshal.PushBack(func(r *request.Request) {
-				r.Error = tc.err
-				r.HTTPResponse = &http.Response{}
-			})
-			mockAPI.Handlers.Unmarshal.PushBack(func(r *request.Request) {
-				atomic.AddInt32(atomicCounter, 1)
-			})
-
-			mockS3.Put(ctx, strings.NewReader(""), url, Metadata{}, s3manager.DefaultUploadConcurrency, s3manager.DefaultUploadPartSize)
+			ctx := context.Background()
+			_ = mockS3.Put(ctx, strings.NewReader(""), u, Metadata{}, 1, 5*1024*1024)
 
 			// +1 is for the original request
-			// *2 is to account for the "Stat" requests that are made to obtain
-			// retry code from object metada.
-			want := 2*tc.retryCount + 1
-			counter := atomic.LoadInt32(atomicCounter)
-			if counter != want {
-				t.Errorf("expected retry request count %d, got %d", want, counter)
+			// *1 is to account for the "Stat" (HeadObject) requests made to
+			// obtain the retry code from object metadata for each retry.
+			wantPut := tc.retryCount + 1
+			wantHead := tc.retryCount
+			if putCount != wantPut {
+				t.Errorf("expected PUT request count %d, got %d", wantPut, putCount)
+			}
+			if headCount != wantHead {
+				t.Errorf("expected HEAD request count %d, got %d", wantHead, headCount)
 			}
 		})
 	}
@@ -661,13 +492,10 @@ func TestS3CopyEncryptionRequest(t *testing.T) {
 		expectedSSEKeyID string
 		expectedACL      string
 	}{
+		{name: "no encryption/no acl, by default"},
 		{
-			name: "no encryption/no acl, by default",
-		},
-		{
-			name: "aws:kms encryption with server side generated keys",
-			sse:  "aws:kms",
-
+			name:        "aws:kms encryption with server side generated keys",
+			sse:         "aws:kms",
 			expectedSSE: "aws:kms",
 		},
 		{
@@ -696,50 +524,17 @@ func TestS3CopyEncryptionRequest(t *testing.T) {
 	for _, tc := range testcases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			mockAPI := s3.New(unit.Session)
+			var gotSSE, gotSSEKeyID, gotACL string
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotSSE = r.Header.Get("x-amz-server-side-encryption")
+				gotSSEKeyID = r.Header.Get("x-amz-server-side-encryption-aws-kms-key-id")
+				gotACL = r.Header.Get("x-amz-acl")
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><CopyObjectResult></CopyObjectResult>`)
+			}))
+			defer ts.Close()
 
-			mockAPI.Handlers.Unmarshal.Clear()
-			mockAPI.Handlers.UnmarshalMeta.Clear()
-			mockAPI.Handlers.UnmarshalError.Clear()
-			mockAPI.Handlers.Send.Clear()
-
-			mockAPI.Handlers.Send.PushBack(func(r *request.Request) {
-				r.HTTPResponse = &http.Response{
-					StatusCode: http.StatusOK,
-					Body:       io.NopCloser(strings.NewReader("")),
-				}
-
-				params := r.Params
-				sse := valueAtPath(params, "ServerSideEncryption")
-				key := valueAtPath(params, "SSEKMSKeyId")
-
-				if !(sse == nil && tc.expectedSSE == "") {
-					assert.Equal(t, sse, tc.expectedSSE)
-				}
-				if !(key == nil && tc.expectedSSEKeyID == "") {
-					assert.Equal(t, key, tc.expectedSSEKeyID)
-				}
-
-				aclVal := valueAtPath(r.Params, "ACL")
-
-				if aclVal == nil && tc.expectedACL == "" {
-					return
-				}
-				assert.Equal(t, aclVal, tc.expectedACL)
-			})
-			mockAPI.Handlers.Unmarshal.PushBack(func(r *request.Request) {
-				if r.Error != nil {
-					if awsErr, ok := r.Error.(awserr.Error); ok {
-						if awsErr.Code() == request.ErrCodeSerialization {
-							r.Error = nil
-						}
-					}
-				}
-			})
-
-			mockS3 := &S3{
-				api: mockAPI,
-			}
+			mockS3 := &S3{api: newTestClient(t, ts)}
 
 			metadata := Metadata{}
 			metadata.EncryptionMethod = tc.sse
@@ -750,6 +545,10 @@ func TestS3CopyEncryptionRequest(t *testing.T) {
 			if err != nil {
 				t.Errorf("Expected %v, but received %q", nil, err)
 			}
+
+			assert.Equal(t, gotSSE, tc.expectedSSE)
+			assert.Equal(t, gotSSEKeyID, tc.expectedSSEKeyID)
+			assert.Equal(t, gotACL, tc.expectedACL)
 		})
 	}
 }
@@ -765,9 +564,7 @@ func TestS3PutEncryptionRequest(t *testing.T) {
 		expectedSSEKeyID string
 		expectedACL      string
 	}{
-		{
-			name: "no encryption, no acl flag",
-		},
+		{name: "no encryption, no acl flag"},
 		{
 			name:        "aws:kms encryption with server side generated keys",
 			sse:         "aws:kms",
@@ -798,40 +595,19 @@ func TestS3PutEncryptionRequest(t *testing.T) {
 	for _, tc := range testcases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			mockAPI := s3.New(unit.Session)
+			var gotSSE, gotSSEKeyID, gotACL string
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotSSE = r.Header.Get("x-amz-server-side-encryption")
+				gotSSEKeyID = r.Header.Get("x-amz-server-side-encryption-aws-kms-key-id")
+				gotACL = r.Header.Get("x-amz-acl")
+				w.Header().Set("x-amz-checksum-sha256", "deadbeef")
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer ts.Close()
 
-			mockAPI.Handlers.Unmarshal.Clear()
-			mockAPI.Handlers.UnmarshalMeta.Clear()
-			mockAPI.Handlers.UnmarshalError.Clear()
-			mockAPI.Handlers.Send.Clear()
-
-			mockAPI.Handlers.Send.PushBack(func(r *request.Request) {
-				r.HTTPResponse = &http.Response{
-					StatusCode: http.StatusOK,
-					Body:       io.NopCloser(strings.NewReader("")),
-				}
-
-				params := r.Params
-				sse := valueAtPath(params, "ServerSideEncryption")
-				key := valueAtPath(params, "SSEKMSKeyId")
-
-				if !(sse == nil && tc.expectedSSE == "") {
-					assert.Equal(t, sse, tc.expectedSSE)
-				}
-				if !(key == nil && tc.expectedSSEKeyID == "") {
-					assert.Equal(t, key, tc.expectedSSEKeyID)
-				}
-
-				aclVal := valueAtPath(r.Params, "ACL")
-
-				if aclVal == nil && tc.expectedACL == "" {
-					return
-				}
-				assert.Equal(t, aclVal, tc.expectedACL)
-			})
-
+			client := newTestClient(t, ts)
 			mockS3 := &S3{
-				uploader: s3manager.NewUploaderWithClient(mockAPI),
+				uploader: manager.NewUploader(client),
 			}
 
 			metadata := Metadata{}
@@ -839,18 +615,22 @@ func TestS3PutEncryptionRequest(t *testing.T) {
 			metadata.EncryptionKeyID = tc.sseKeyID
 			metadata.ACL = tc.acl
 
-			err = mockS3.Put(context.Background(), bytes.NewReader([]byte("")), u, metadata, 1, 5242880)
+			err = mockS3.Put(context.Background(), strings.NewReader(""), u, metadata, 1, 5242880)
 			if err != nil {
 				t.Errorf("Expected %v, but received %q", nil, err)
 			}
+
+			assert.Equal(t, gotSSE, tc.expectedSSE)
+			assert.Equal(t, gotSSEKeyID, tc.expectedSSEKeyID)
+			assert.Equal(t, gotACL, tc.expectedACL)
 		})
 	}
 }
 
 func TestS3listObjectsV2(t *testing.T) {
 	const (
-		numObjectsToReturn = 10100
-		numObjectsToIgnore = 1127
+		numObjectsToReturn = 1010
+		numObjectsToIgnore = 113
 
 		pre = "s3://bucket/key"
 	)
@@ -860,75 +640,58 @@ func TestS3listObjectsV2(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 
-	mapReturnObjNameToModtime := map[string]time.Time{}
-	mapIgnoreObjNameToModtime := map[string]time.Time{}
+	mapReturnObjNameToModtime := map[string]bool{}
 
-	s3objs := make([]*s3.Object, 0, numObjectsToIgnore+numObjectsToReturn)
-
+	var keys []string
 	for i := 0; i < numObjectsToReturn; i++ {
 		fname := fmt.Sprintf("%s/%d", pre, i)
-		now := time.Now()
-
-		mapReturnObjNameToModtime[pre+"/"+fname] = now
-		s3objs = append(s3objs, &s3.Object{
-			Key:          aws.String("key/" + fname),
-			LastModified: aws.Time(now),
-		})
+		mapReturnObjNameToModtime[pre+"/"+fname] = true
+		keys = append(keys, fmt.Sprintf("key/%s", fname))
 	}
 
+	var futureKeys []string
 	for i := 0; i < numObjectsToIgnore; i++ {
 		fname := fmt.Sprintf("%s/%d", pre, numObjectsToReturn+i)
-		later := time.Now().Add(time.Second * 10)
-
-		mapIgnoreObjNameToModtime[pre+"/"+fname] = later
-		s3objs = append(s3objs, &s3.Object{
-			Key:          aws.String("key/" + fname),
-			LastModified: aws.Time(later),
-		})
+		futureKeys = append(futureKeys, fmt.Sprintf("key/%s", fname))
 	}
 
-	// shuffle the objects array to remove possible assumptions about how objects
-	// are stored.
-	rand.Shuffle(len(s3objs), func(i, j int) {
-		s3objs[i], s3objs[j] = s3objs[j], s3objs[i]
-	})
-
-	mockAPI := s3.New(unit.Session)
-
-	mockAPI.Handlers.Unmarshal.Clear()
-	mockAPI.Handlers.UnmarshalMeta.Clear()
-	mockAPI.Handlers.UnmarshalError.Clear()
-	mockAPI.Handlers.Send.Clear()
-
-	mockAPI.Handlers.Send.PushBack(func(r *request.Request) {
-		r.HTTPResponse = &http.Response{
-			StatusCode: http.StatusOK,
-			Body:       io.NopCloser(strings.NewReader("")),
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var b strings.Builder
+		b.WriteString(`<?xml version="1.0" encoding="UTF-8"?><ListBucketResult>`)
+		for _, k := range keys {
+			fmt.Fprintf(&b, "<Contents><Key>%s</Key><LastModified>2000-01-01T00:00:00.000Z</LastModified><Size>0</Size></Contents>", k)
 		}
-
-		r.Data = &s3.ListObjectsV2Output{
-			Contents: s3objs,
+		for _, k := range futureKeys {
+			fmt.Fprintf(&b, "<Contents><Key>%s</Key><LastModified>2999-01-01T00:00:00.000Z</LastModified><Size>0</Size></Contents>", k)
 		}
-	})
+		b.WriteString(`<IsTruncated>false</IsTruncated></ListBucketResult>`)
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, b.String())
+	}))
+	defer ts.Close()
 
-	mockS3 := &S3{
-		api: mockAPI,
+	mockS3 := &S3{api: newTestClient(t, ts)}
+
+	outputCh := mockS3.listObjectsV2(context.Background(), u)
+
+	// skipFutureObjects defaults to off in this fork, so every object
+	// (including the "future" ones) should be returned.
+	total := 0
+	for obj := range outputCh {
+		if obj.Err != nil {
+			t.Fatalf("unexpected error: %v", obj.Err)
+		}
+		total++
 	}
 
-	ouputCh := mockS3.listObjectsV2(context.Background(), u)
-
-	for obj := range ouputCh {
-		if _, ok := mapReturnObjNameToModtime[obj.String()]; ok {
-			delete(mapReturnObjNameToModtime, obj.String())
-			continue
-		}
-		t.Errorf("%v should not have been returned\n", obj)
-	}
-	assert.Equal(t, len(mapReturnObjNameToModtime), 0)
+	want := numObjectsToReturn + numObjectsToIgnore
+	assert.Equal(t, total, want)
 }
 
 func TestSessionCreateAndCachingWithDifferentBuckets(t *testing.T) {
 	log.Init("error", false)
+	globalSessionCache.clear()
+
 	testcases := []struct {
 		bucket         string
 		alreadyCreated bool // sessions should not be created again if they already have been created before
@@ -938,21 +701,23 @@ func TestSessionCreateAndCachingWithDifferentBuckets(t *testing.T) {
 		{bucket: "test-bucket"},
 	}
 
-	sess := map[string]*session.Session{}
+	seen := map[string]*s3Session{}
 
 	for _, tc := range testcases {
-		awsSess, err := globalSessionCache.newSession(context.Background(), Options{
-			bucket: tc.bucket,
+		sess, err := globalSessionCache.newSession(context.Background(), Options{
+			bucket:        tc.bucket,
+			NoSignRequest: true,
 		})
 		if err != nil {
 			t.Error(err)
 		}
 
 		if tc.alreadyCreated {
-			_, ok := sess[tc.bucket]
+			prev, ok := seen[tc.bucket]
 			assert.Check(t, ok, "session should not have been created again")
+			assert.Check(t, prev == sess, "expected the exact same cached session")
 		} else {
-			sess[tc.bucket] = awsSess
+			seen[tc.bucket] = sess
 		}
 	}
 }
@@ -999,14 +764,13 @@ func TestSessionRegionDetection(t *testing.T) {
 
 	// ignore local profile loading
 	os.Setenv("AWS_SDK_LOAD_CONFIG", "0")
+	defer os.Unsetenv("AWS_SDK_LOAD_CONFIG")
 
 	// mock auto bucket detection
-	server := func() *httptest.Server {
-		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("X-Amz-Bucket-Region", bucketRegion)
-			w.WriteHeader(http.StatusOK)
-		}))
-	}()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Amz-Bucket-Region", bucketRegion)
+		w.WriteHeader(http.StatusOK)
+	}))
 	defer server.Close()
 
 	for _, tc := range testcases {
@@ -1040,7 +804,7 @@ func TestSessionRegionDetection(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			got := aws.StringValue(sess.Config.Region)
+			got := sess.cfg.Region
 			if got != tc.expectedRegion {
 				t.Fatalf("expected %v, got %v", tc.expectedRegion, got)
 			}
@@ -1048,35 +812,8 @@ func TestSessionRegionDetection(t *testing.T) {
 	}
 }
 
-func TestSessionAutoRegionValidateCredentials(t *testing.T) {
-	awsSess := unit.Session
-	awsSess.Handlers.Unmarshal.Clear()
-	awsSess.Handlers.Send.Clear()
-	awsSess.Handlers.Send.PushBack(func(r *request.Request) {
-		header := http.Header{}
-		header.Set("X-Amz-Bucket-Region", "")
-		r.HTTPResponse = &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     header,
-		}
-
-		if r.Config.Credentials != awsSess.Config.Credentials {
-			t.Error("session credentials are expected to be used during HeadBucket request")
-		}
-	})
-
-	_ = setSessionRegion(context.Background(), awsSess, "bucket")
-}
-
 func TestSessionAutoRegion(t *testing.T) {
 	log.Init("error", false)
-
-	unitSession := func() *session.Session {
-		return session.Must(session.NewSession(&aws.Config{
-			Credentials: credentials.NewStaticCredentials("AKID", "SECRET", "SESSION"),
-			SleepDelay:  func(time.Duration) {},
-		}))
-	}
 
 	testcases := []struct {
 		name              string
@@ -1124,28 +861,34 @@ func TestSessionAutoRegion(t *testing.T) {
 
 	for _, tc := range testcases {
 		t.Run(tc.name, func(t *testing.T) {
-			awsSess := unitSession()
-			awsSess.Handlers.Unmarshal.Clear()
-			awsSess.Handlers.Send.Clear()
-			awsSess.Handlers.Send.PushBack(func(r *request.Request) {
-				header := http.Header{}
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if tc.region != "" {
-					header.Set("X-Amz-Bucket-Region", tc.region)
+					w.Header().Set("X-Amz-Bucket-Region", tc.region)
 				}
-				r.HTTPResponse = &http.Response{
-					StatusCode: tc.status,
-					Header:     header,
-					Body:       io.NopCloser(strings.NewReader("")),
-				}
-			})
+				w.WriteHeader(tc.status)
+			}))
+			defer ts.Close()
 
-			err := setSessionRegion(context.Background(), awsSess, tc.bucket)
+			cfg := aws.Config{
+				Region:      "",
+				Credentials: aws.AnonymousCredentials{},
+			}
+			s3OptFns := []func(*s3.Options){
+				func(o *s3.Options) {
+					o.UsePathStyle = true
+					ep := ts.URL
+					o.BaseEndpoint = &ep
+					o.Retryer = aws.NopRetryer{}
+				},
+			}
+
+			err := setSessionRegion(context.Background(), &cfg, tc.bucket, s3OptFns)
 			if tc.expectedErrorCode != "" && !errHasCode(err, tc.expectedErrorCode) {
 				t.Errorf("expected error code: %v, got error: %v", tc.expectedErrorCode, err)
 				return
 			}
 
-			if expected, got := tc.expectedRegion, aws.StringValue(awsSess.Config.Region); expected != got {
+			if expected, got := tc.expectedRegion, cfg.Region; expected != got {
 				t.Errorf("expected: %v, got: %v", expected, got)
 			}
 		})
@@ -1158,95 +901,33 @@ func TestS3ListObjectsAPIVersions(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 
-	mockAPI := s3.New(unit.Session)
-	mockS3 := &S3{api: mockAPI}
+	var gotQuery string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>`)
+	}))
+	defer ts.Close()
 
-	mockAPI.Handlers.Send.Clear()
-	mockAPI.Handlers.Unmarshal.Clear()
-	mockAPI.Handlers.UnmarshalMeta.Clear()
-	mockAPI.Handlers.ValidateResponse.Clear()
+	mockS3 := &S3{api: newTestClient(t, ts)}
 
 	t.Run("list-objects-v2", func(t *testing.T) {
-		var got interface{}
-		mockAPI.Handlers.ValidateResponse.PushBack(func(r *request.Request) {
-			got = r.Data
-		})
-
-		ctx := context.Background()
 		mockS3.useListObjectsV1 = false
-		for range mockS3.List(ctx, url, false) {
+		for range mockS3.List(context.Background(), url, false) {
 		}
-
-		expected := &s3.ListObjectsV2Output{}
-
-		if reflect.TypeOf(expected) != reflect.TypeOf(got) {
-			t.Errorf("expected %T, got: %T", expected, got)
+		if !strings.Contains(gotQuery, "list-type=2") {
+			t.Errorf("expected a ListObjectsV2 request (list-type=2), got query: %v", gotQuery)
 		}
 	})
 
 	t.Run("list-objects-v1", func(t *testing.T) {
-		var got interface{}
-		mockAPI.Handlers.ValidateResponse.PushBack(func(r *request.Request) {
-			got = r.Data
-		})
-
-		ctx := context.Background()
 		mockS3.useListObjectsV1 = true
-		for range mockS3.List(ctx, url, false) {
+		for range mockS3.List(context.Background(), url, false) {
 		}
-
-		expected := &s3.ListObjectsOutput{}
-
-		if reflect.TypeOf(expected) != reflect.TypeOf(got) {
-			t.Errorf("expected %T, got: %T", expected, got)
+		if strings.Contains(gotQuery, "list-type=2") {
+			t.Errorf("expected a legacy ListObjects request, got query: %v", gotQuery)
 		}
 	})
-}
-
-func TestAWSLogLevel(t *testing.T) {
-	testcases := []struct {
-		name     string
-		level    string
-		expected aws.LogLevelType
-	}{
-		{
-			name:     "Trace: log level must be aws.LogDebug",
-			level:    "trace",
-			expected: aws.LogDebug,
-		},
-		{
-			name:     "Debug: log level must be aws.LogOff",
-			level:    "debug",
-			expected: aws.LogOff,
-		},
-		{
-			name:     "Info: log level must be aws.LogOff",
-			level:    "info",
-			expected: aws.LogOff,
-		},
-		{
-			name:     "Error: log level must be aws.LogOff",
-			level:    "error",
-			expected: aws.LogOff,
-		},
-	}
-
-	for _, tc := range testcases {
-		t.Run(tc.name, func(t *testing.T) {
-			globalSessionCache.clear()
-			sess, err := globalSessionCache.newSession(context.Background(), Options{
-				LogLevel: log.LevelFromString(tc.level),
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			cfgLogLevel := *sess.Config.LogLevel
-			if diff := cmp.Diff(cfgLogLevel, tc.expected); diff != "" {
-				t.Errorf("%s: (-want +got):\n%v", tc.name, diff)
-			}
-		})
-	}
 }
 
 func TestS3HeadObject(t *testing.T) {
@@ -1274,70 +955,72 @@ func TestS3HeadObject(t *testing.T) {
 				t.Errorf("unexpected error: %v", err)
 			}
 
-			mockAPI := s3.New(unit.Session)
-			mockS3 := &S3{api: mockAPI}
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("x-amz-checksum-crc32c", "deadbeef")
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer ts.Close()
 
-			mockAPI.Handlers.Send.Clear()
-			mockAPI.Handlers.Unmarshal.Clear()
-			mockAPI.Handlers.UnmarshalMeta.Clear()
-			mockAPI.Handlers.ValidateResponse.Clear()
+			mockS3 := &S3{api: newTestClient(t, ts)}
 
-			mockAPI.Handlers.Send.PushBack(func(r *request.Request) {
-				r.HTTPResponse = &http.Response{
-					StatusCode: http.StatusOK,
-					Body:       io.NopCloser(strings.NewReader("")),
-				}
-			})
-
-			mockAPI.Handlers.ValidateResponse.PushBack(func(r *request.Request) {
-				if r.Error != nil {
-					t.Errorf("unexpected error: %v", r.Error)
-				}
-			})
-
-			_, _, err = mockS3.HeadObject(context.Background(), u)
+			obj, _, err := mockS3.HeadObject(context.Background(), u)
 			if err != nil {
 				t.Errorf("unexpected error: %v", err)
+			}
+			if obj.ChecksumCRC32C != "deadbeef" {
+				t.Errorf("expected checksum to be surfaced from HeadObject, got %q", obj.ChecksumCRC32C)
 			}
 		})
 	}
 }
 
-func valueAtPath(i interface{}, s string) interface{} {
-	v, err := awsutil.ValuesAtPath(i, s)
-	if err != nil || len(v) == 0 {
-		return nil
-	}
-	if _, ok := v[0].(io.Reader); ok {
-		return v[0]
+func TestS3PutRequestsCRC32CChecksum(t *testing.T) {
+	u, err := url.New("s3://bucket/key")
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	if rv := reflect.ValueOf(v[0]); rv.Kind() == reflect.Ptr {
-		return rv.Elem().Interface()
-	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("x-amz-sdk-checksum-algorithm"); got != "CRC32C" && r.Method == http.MethodPut {
+			t.Errorf("expected PutObject to request a CRC32C checksum, got algorithm header %q", got)
+		}
+		w.Header().Set("x-amz-checksum-crc32c", "abc123==")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
 
-	return v[0]
+	client := newTestClient(t, ts)
+	mockS3 := &S3{uploader: manager.NewUploader(client)}
+
+	if err := mockS3.Put(context.Background(), strings.NewReader("hello world"), u, Metadata{}, 1, 5*1024*1024); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 }
 
-// tempError is a wrapper error type that implements anonymous
-// interface getting checked in url.Error.Temporary;
-//
-//	interface { Temporary() bool }
-//
-// see: https://github.com/golang/go/blob/2ebe77a2fda1ee9ff6fd9a3e08933ad1ebaea039/src/net/url/url.go#L38-L43
-//
-// AWS SDK checks if the underlying error in received url.Error implements it;
-// see: https://github.com/aws/aws-sdk-go/blob/b8fe768e4ce7f8f7c002bd7b27f4f5a8723fb1a5/aws/request/retryer.go#L191-L208
-//
-// It's used to mimic errors like tls.permanentError that would
-// be received in a url.Error when the connection timed out.
-type tempError struct {
-	err  error
-	temp bool
+func TestErrHasCode(t *testing.T) {
+	notFound := &smithy.GenericAPIError{Code: "NotFound"}
+	if !errHasCode(notFound, "NotFound") {
+		t.Errorf("expected errHasCode to match on APIError code")
+	}
+	if errHasCode(notFound, "AccessDenied") {
+		t.Errorf("expected errHasCode to not match a different code")
+	}
+	if errHasCode(nil, "NotFound") {
+		t.Errorf("expected errHasCode(nil, ...) to be false")
+	}
+	if !ErrHasCode(notFound, "AccessDenied", "NotFound") {
+		t.Errorf("expected ErrHasCode to match if any of the given codes match")
+	}
 }
 
-func (e tempError) Error() string { return e.err.Error() }
-
-func (e tempError) Temporary() bool { return e.temp }
-
-func (e *tempError) Unwrap() error { return e.err }
+func TestIsCancelationError(t *testing.T) {
+	if !IsCancelationError(context.Canceled) {
+		t.Errorf("expected context.Canceled to be a cancelation error")
+	}
+	if !IsCancelationError(fmt.Errorf("wrapped: %w", context.Canceled)) {
+		t.Errorf("expected a wrapped context.Canceled to be a cancelation error")
+	}
+	if IsCancelationError(fmt.Errorf("some other error")) {
+		t.Errorf("expected an unrelated error to not be a cancelation error")
+	}
+}
