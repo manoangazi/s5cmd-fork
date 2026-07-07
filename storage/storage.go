@@ -110,7 +110,12 @@ type Object struct {
 	Etag              string       `json:"etag,omitempty"`
 	ChecksumCRC32C    string       `json:"checksum_crc32c,omitempty"`
 	ChecksumCRC64NVME string       `json:"checksum_crc64nvme,omitempty"`
-	ModTime           *time.Time   `json:"last_modified,omitempty"`
+	// ChecksumAlgo is the checksum algorithm the object carries as reported by
+	// ListObjectsV2 ("crc32c", "crc64nvme", "sha256", "sha1", "crc32"). Unlike
+	// the checksum values above, the algorithm IS returned in listings (the
+	// value still requires a HeadObject), so this is cheap to surface per row.
+	ChecksumAlgo string       `json:"checksum_algo,omitempty"`
+	ModTime      *time.Time   `json:"last_modified,omitempty"`
 	Type              ObjectType   `json:"type,omitempty"`
 	Size              int64        `json:"size,omitempty"`
 	StorageClass      StorageClass `json:"storage_class,omitempty"`

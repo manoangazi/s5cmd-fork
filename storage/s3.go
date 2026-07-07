@@ -83,6 +83,18 @@ func uploadChecksumAlgorithm() types.ChecksumAlgorithm {
 	}
 }
 
+// checksumAlgoString maps the ChecksumAlgorithm slice ListObjectsV2 returns for
+// an object into a single lowercase algorithm name for the Object.ChecksumAlgo
+// field ("crc32c", "crc64nvme", "sha256", "sha1", "crc32"). Returns "" when the
+// object carries no checksum. AWS returns at most one algorithm per object here,
+// so the first entry is authoritative.
+func checksumAlgoString(algos []types.ChecksumAlgorithm) string {
+	if len(algos) == 0 {
+		return ""
+	}
+	return strings.ToLower(string(algos[0]))
+}
+
 // S3 is a storage type which interacts with an S3 API client, a
 // Downloader and an Uploader.
 type S3 struct {
@@ -398,6 +410,7 @@ func (s *S3) listObjectsV2(ctx context.Context, url *url.URL) <-chan *Object {
 				objCh <- &Object{
 					URL:          newurl,
 					Etag:         strings.Trim(etag, `"`),
+					ChecksumAlgo: checksumAlgoString(c.ChecksumAlgorithm),
 					ModTime:      &mod,
 					Type:         ObjectType{objtype},
 					Size:         aws.ToInt64(c.Size),
@@ -489,6 +502,7 @@ func (s *S3) listObjects(ctx context.Context, url *url.URL) <-chan *Object {
 				objCh <- &Object{
 					URL:          newurl,
 					Etag:         strings.Trim(etag, `"`),
+					ChecksumAlgo: checksumAlgoString(c.ChecksumAlgorithm),
 					ModTime:      &mod,
 					Type:         ObjectType{objtype},
 					Size:         aws.ToInt64(c.Size),
