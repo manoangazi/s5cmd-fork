@@ -110,6 +110,7 @@ type Object struct {
 	Etag              string       `json:"etag,omitempty"`
 	ChecksumCRC32C    string       `json:"checksum_crc32c,omitempty"`
 	ChecksumCRC64NVME string       `json:"checksum_crc64nvme,omitempty"`
+	ChecksumSHA256    string       `json:"checksum_sha256,omitempty"`
 	// ChecksumAlgo is the checksum algorithm the object carries as reported by
 	// ListObjectsV2 ("crc32c", "crc64nvme", "sha256", "sha1", "crc32"). Unlike
 	// the checksum values above, the algorithm IS returned in listings (the

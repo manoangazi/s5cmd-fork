@@ -182,6 +182,7 @@ func (s *S3) Stat(ctx context.Context, url *url.URL) (*Object, error) {
 		Etag:              strings.Trim(etag, `"`),
 		ChecksumCRC32C:    aws.ToString(output.ChecksumCRC32C),
 		ChecksumCRC64NVME: aws.ToString(output.ChecksumCRC64NVME),
+		ChecksumSHA256:    aws.ToString(output.ChecksumSHA256),
 		ModTime:           &mod,
 		Size:              aws.ToInt64(output.ContentLength),
 	}
@@ -1307,6 +1308,7 @@ func (s *S3) HeadObject(ctx context.Context, url *url.URL) (*Object, *Metadata, 
 		Etag:              strings.Trim(aws.ToString(output.ETag), `"`),
 		ChecksumCRC32C:    aws.ToString(output.ChecksumCRC32C),
 		ChecksumCRC64NVME: aws.ToString(output.ChecksumCRC64NVME),
+		ChecksumSHA256:    aws.ToString(output.ChecksumSHA256),
 		Size:              aws.ToInt64(output.ContentLength),
 		StorageClass:      StorageClass(storageClassStr),
 	}

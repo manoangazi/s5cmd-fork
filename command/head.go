@@ -133,6 +133,7 @@ func (h Head) Run(ctx context.Context) error {
 		ETag:                 object.Etag,
 		ChecksumCRC32C:       object.ChecksumCRC32C,
 		ChecksumCRC64NVME:    object.ChecksumCRC64NVME,
+		ChecksumSHA256:       object.ChecksumSHA256,
 		Metadata:             metadata.UserDefined,
 	}
 
@@ -152,6 +153,7 @@ type HeadObjectMessage struct {
 	ETag                 string            `json:"etag,omitempty"`
 	ChecksumCRC32C       string            `json:"checksum_crc32c,omitempty"`
 	ChecksumCRC64NVME    string            `json:"checksum_crc64nvme,omitempty"`
+	ChecksumSHA256       string            `json:"checksum_sha256,omitempty"`
 	Metadata             map[string]string `json:"metadata"`
 }
 
